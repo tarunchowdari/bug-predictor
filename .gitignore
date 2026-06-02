@@ -1,0 +1,44 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# All data (large files — do not commit)
+data/
+
+# Model artifacts
+models/baseline/*.pkl
+models/baseline/*.json
+models/fusion/*.pt
+models/fusion/*.pth
+
+# Experiments
+experiments/
+
+# Node
+node_modules/
+dashboard/dist/
+dashboard/.vite/
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Misc
+*.npy
+*.png
+.env
