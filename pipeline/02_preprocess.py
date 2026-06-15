@@ -33,6 +33,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
 import re
@@ -43,6 +44,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from sklearn.utils import resample
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
 # Constants
 
@@ -68,6 +72,7 @@ REQUIRED_OUTPUT_COLUMNS: list[str] = [
     "modified_files", "is_merge",
     *KAMEI_METRICS,
     "label",
+    "diff_text",   # empty string for PROMISE rows; real diff for PyDriller rows
 ]
 
 # Logging
@@ -243,7 +248,7 @@ def merge_and_clean(
     df = df.sort_values("_sort").drop(columns=["_sort"])
     before = len(df)
     df = df.drop_duplicates(subset=["commit_hash"], keep="first")
-    logger.info("Deduplication: %d → %d rows (removed %d duplicates)",
+    logger.info("Deduplication: %d -> %d rows (removed %d duplicates)",
                 before, len(df), before - len(df))
 
     # Drop unlabeled rows
@@ -322,7 +327,7 @@ def merge_and_clean(
                     rescued = pd.to_numeric(df[alias], errors="coerce").fillna(0)
                     if rescued.gt(0).any():
                         logger.info(
-                            "Alias rescue: copied '%s' → '%s' (%d non-zero rows).",
+                            "Alias rescue: copied '%s' -> '%s' (%d non-zero rows).",
                             alias, target, rescued.gt(0).sum(),
                         )
                         df[target] = rescued.astype("float32")
@@ -422,7 +427,7 @@ def export_schema(df: pd.DataFrame, output_path: Path) -> None:
     with open(output_path, "w", encoding="utf-8") as fh:
         json.dump(schema, fh, indent=2, default=str)
 
-    logger.info("Schema written → %s", output_path)
+    logger.info("Schema written -> %s", output_path)
 
 
 # Orchestrator
@@ -439,21 +444,49 @@ def preprocess(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     output_parquet = output_dir / "commits_clean.parquet"
-    output_schema = output_dir / "schema.json"
+    output_schema  = output_dir / "schema.json"
 
-    # Load inputs
+    # Load mined commits — prefer the diff-enriched version if it exists
     mined_df: pd.DataFrame | None = None
-    if mined_parquet is not None and mined_parquet.exists():
-        logger.info("Loading mined commits: %s", mined_parquet)
-        mined_df = pd.read_parquet(mined_parquet, engine="pyarrow")
-        logger.info("  Loaded %d rows from mined parquet.", len(mined_df))
-    else:
-        logger.warning("Mined parquet not found: %s", mined_parquet)
+    if mined_parquet is not None:
+        enriched = mined_parquet.parent / "mined_commits_with_diffs.parquet"
+        if enriched.exists():
+            logger.info(
+                "Found enriched mined parquet — loading: %s", enriched
+            )
+            mined_df = pd.read_parquet(enriched, engine="pyarrow")
+        elif mined_parquet.exists():
+            logger.info("Loading mined commits: %s", mined_parquet)
+            mined_df = pd.read_parquet(mined_parquet, engine="pyarrow")
+        else:
+            logger.warning("Mined parquet not found: %s", mined_parquet)
+
+        if mined_df is not None:
+            logger.info("  Loaded %d mined rows.", len(mined_df))
+            if "diff_text" not in mined_df.columns:
+                # Enriched file expected but column missing — fill with empty
+                logger.warning("  diff_text column missing from mined parquet — filling with empty string.")
+                mined_df["diff_text"] = ""
 
     kamei_df = load_kamei_dataset(kamei_dir)
 
     # Merge + clean
     df = merge_and_clean(mined_df, kamei_df)
+
+    # PROMISE rows have no source code — give them an empty diff_text
+    if "diff_text" in df.columns:
+        df["diff_text"] = df["diff_text"].fillna("").astype(str)
+        promise_mask = df["source"] == "kamei"
+        df.loc[promise_mask, "diff_text"] = ""
+        logger.info(
+            "diff_text: %d non-empty (PyDriller), %d empty (PROMISE + fallback)",
+            (df["diff_text"] != "").sum(),
+            (df["diff_text"] == "").sum(),
+        )
+    else:
+        # No diff text available at all — add empty column so downstream doesn't break
+        logger.info("No diff_text available — adding empty column (run 01b_extract_diffs.py to populate).")
+        df["diff_text"] = ""
 
     # Balance
     df = balance_dataset(df, min_buggy_ratio)
@@ -467,7 +500,7 @@ def preprocess(
     # Save
     df.to_parquet(output_parquet, index=False, engine="pyarrow")
     logger.info(
-        "Saved cleaned dataset → %s  (%d rows × %d cols)",
+        "Saved cleaned dataset -> %s  (%d rows x %d cols)",
         output_parquet, len(df), len(df.columns),
     )
 
@@ -481,9 +514,9 @@ def preprocess(
 
 def _print_schema_summary(df: pd.DataFrame) -> None:
     """Pretty-print the output parquet schema and stats."""
-    sep = "─" * 72
+    sep = "-" * 72
     print(f"\n{sep}")
-    print("  OUTPUT PARQUET SCHEMA — data/processed/commits_clean.parquet")
+    print("  OUTPUT PARQUET SCHEMA -- data/processed/commits_clean.parquet")
     print(sep)
     print(f"  Rows    : {len(df):,}")
     print(f"  Columns : {len(df.columns)}")
@@ -493,7 +526,7 @@ def _print_schema_summary(df: pd.DataFrame) -> None:
           f"ratio={buggy/(buggy+clean):.2%}")
     print(sep)
     print(f"  {'COLUMN':<30}  {'DTYPE':<22}  {'NON-NULL':>8}  {'NULL%':>6}")
-    print(f"  {'──────':<30}  {'─────':<22}  {'────────':>8}  {'─────':>6}")
+    print(f"  {'------':<30}  {'-----':<22}  {'--------':>8}  {'-----':>6}")
     for col in df.columns:
         non_null = df[col].notna().sum()
         null_pct = 100 * (1 - non_null / max(len(df), 1))

@@ -56,6 +56,32 @@ FEATURE_NAMES_PATH = EXPERIMENTS_DIR / "feature_names.json"
 GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
 EMBED_MODEL_NAME      = "sentence-transformers/all-MiniLM-L6-v2"
 
+# Thresholds — override the value baked into the saved model
+GLOBAL_THRESHOLD   = 0.30   # lowered from 0.3388 to improve recall on borderline commits
+SECURITY_THRESHOLD = 0.22   # even more sensitive for commits touching auth/crypto/payment paths
+
+SECURITY_FILE_PATTERNS = [
+    "auth", "authentication", "authorize", "permission",
+    "password", "passwd", "credential", "secret", "token",
+    "session", "cookie", "csrf", "oauth", "jwt", "encrypt",
+    "decrypt", "crypto", "security", "middleware", "payment",
+    "billing", "card", "wallet", "transaction", "login",
+    "logout", "register", "signup", "account", "access",
+    "privilege", "admin", "sudo", "root", "firewall",
+    "ssl", "tls", "cert", "key", "hash", "salt",
+]
+
+
+def get_threshold(modified_files: list[str]) -> float:
+    """Return SECURITY_THRESHOLD if any file path looks security-sensitive, else GLOBAL_THRESHOLD."""
+    for file_path in modified_files:
+        file_lower = file_path.lower()
+        for pattern in SECURITY_FILE_PATTERNS:
+            if pattern in file_lower:
+                return SECURITY_THRESHOLD
+    return GLOBAL_THRESHOLD
+
+
 MAX_PREDICTIONS = 1000  # drop oldest when full
 _predictions: list[dict[str, Any]] = []
 
@@ -157,11 +183,12 @@ class CommitFeatures(BaseModel):
     max_depth_after:         float = Field(0.0, ge=0)
     depth_delta:             float = 0.0
     unique_node_types_added: float = Field(0.0, ge=0)
-    # Metadata (not used for prediction)
+    # Metadata (not used for prediction, but modified_files drives threshold selection)
     commit_sha:     Optional[str] = None
     repo:           Optional[str] = None
     author:         Optional[str] = None
     commit_message: Optional[str] = None
+    modified_files: list[str] = []
 
 
 class PredictionResponse(BaseModel):
@@ -206,12 +233,17 @@ def _risk_level(prob: float, threshold: float) -> str:
 def _run_prediction(
     cf: CommitFeatures,
     kamei_metrics: Optional[dict] = None,
+    threshold_override: Optional[float] = None,
 ) -> PredictionResponse:
-    bundle   = _get_bundle()
-    X        = _features_to_array(cf)
-    bug_prob = float(bundle.stage1_model.predict_proba(X)[0, 1])
-    is_buggy = bug_prob >= bundle.threshold
-    risk     = _risk_level(bug_prob, bundle.threshold)
+    bundle    = _get_bundle()
+    X         = _features_to_array(cf)
+    bug_prob  = float(bundle.stage1_model.predict_proba(X)[0, 1])
+
+    # Use the caller-supplied threshold if provided; otherwise derive from modified files.
+    # This replaces bundle.threshold (the value baked into the pkl) with our global override.
+    threshold = threshold_override if threshold_override is not None else get_threshold(cf.modified_files)
+    is_buggy  = bug_prob >= threshold
+    risk      = _risk_level(bug_prob, threshold)
 
     severity: Optional[float] = None
     if is_buggy and bundle.stage2_model is not None:
@@ -238,7 +270,7 @@ def _run_prediction(
         is_buggy       = bool(is_buggy),
         risk_level     = risk,
         severity_score = round(severity, 4) if severity is not None else None,
-        threshold      = round(bundle.threshold, 4),
+        threshold      = round(threshold, 4),
         timestamp      = now,
         feature_shap   = {k: round(v, 5) for k, v in shap_dict.items()} if shap_dict else None,
     )
@@ -290,6 +322,7 @@ async def _startup():
 async def predict(cf: CommitFeatures):
     """Predict bug recurrence risk for a single commit."""
     try:
+        # get_threshold() is called inside _run_prediction via cf.modified_files
         return _run_prediction(cf)
     except Exception as exc:
         logger.exception("Prediction error")
@@ -391,14 +424,24 @@ async def github_webhook(request: Request):
             if not metrics_warning:
                 metrics_warning = "metrics_unavailable: no clone_url"
 
-        cf   = CommitFeatures(
+        # Collect all file paths touched by this commit for threshold selection.
+        # GitHub push payloads split files into added/removed/modified lists.
+        commit_files: list[str] = (
+            commit.get("added",    []) +
+            commit.get("removed",  []) +
+            commit.get("modified", [])
+        )
+        used_threshold = get_threshold(commit_files)
+
+        cf = CommitFeatures(
             **kamei,
             commit_sha     = commit_hash or None,
             repo           = repo_name,
             author         = author_name,
             commit_message = commit_message,
+            modified_files = commit_files,
         )
-        pred   = _run_prediction(cf, kamei_metrics=kamei)
+        pred   = _run_prediction(cf, kamei_metrics=kamei, threshold_override=used_threshold)
         result = pred.model_dump()
         result["kamei_metrics"] = kamei
         if metrics_warning:
